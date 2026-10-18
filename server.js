@@ -13,8 +13,14 @@ app.use(express.json({ limit: "100kb" }));
 app.use(express.static(path.join(__dirname, "public")));
 
 const SESSION_TTL = 7 * 24 * 60 * 60 * 1000;
-const sessions = new Map();
 const loginFailures = new Map();
+const secureCookies = process.env.NODE_ENV === "production" || process.env.VERCEL === "1";
+
+app.get("/api/health", async (req, res) => {
+  await db.get("SELECT 1 AS ok");
+  console.log(`course-planner health ok (${db.dialect})`);
+  res.json({ ok: true, database: db.dialect });
+});
 
 /* ---------- 会话与密码 ---------- */
 
@@ -27,31 +33,52 @@ function readCookies(req) {
   return out;
 }
 
-function userFromRequest(req) {
+function sessionTokenHash(token) {
+  return crypto.createHash("sha256").update(token).digest("hex");
+}
+
+async function userFromRequest(req) {
   const sid = readCookies(req).sid;
   if (!sid) return null;
-  const session = sessions.get(sid);
+  const session = await db.get(
+    "SELECT user_id, created_at FROM sessions WHERE token_hash = ?",
+    [sessionTokenHash(sid)]
+  );
   if (!session) return null;
-  if (Date.now() - session.createdAt > SESSION_TTL) {
-    sessions.delete(sid);
+  const createdAt = Date.parse(session.created_at);
+  if (Date.now() - createdAt > SESSION_TTL) {
+    await db.run("DELETE FROM sessions WHERE token_hash = ?", [sessionTokenHash(sid)]);
     return null;
   }
-  return session;
+  return { userId: session.user_id, createdAt };
 }
 
-function requireAuth(req, res, next) {
-  const session = userFromRequest(req);
-  if (!session) return res.status(401).json({ error: "请先登录" });
-  req.session = session;
-  next();
+async function requireAuth(req, res, next) {
+  try {
+    const session = await userFromRequest(req);
+    if (!session) return res.status(401).json({ error: "请先登录" });
+    req.session = session;
+    next();
+  } catch (error) {
+    next(error);
+  }
 }
 
-function startSession(res, userId) {
+async function startSession(res, userId) {
   const token = crypto.randomBytes(32).toString("base64url");
-  sessions.set(token, { userId, createdAt: Date.now() });
+  const createdAt = new Date().toISOString();
+  const expiredBefore = new Date(Date.now() - SESSION_TTL).toISOString();
+  await db.transaction(async (tx) => {
+    await tx.run("DELETE FROM sessions WHERE created_at < ?", [expiredBefore]);
+    await tx.run(
+      "INSERT INTO sessions (token_hash, user_id, created_at) VALUES (?, ?, ?)",
+      [sessionTokenHash(token), userId, createdAt]
+    );
+  });
   res.cookie("sid", token, {
     httpOnly: true,
     sameSite: "lax",
+    secure: secureCookies,
     path: "/",
     maxAge: SESSION_TTL,
   });
@@ -71,8 +98,9 @@ function verifyPassword(password, stored) {
   return expected.length === actual.length && crypto.timingSafeEqual(expected, actual);
 }
 
-function accountCount() {
-  return db.prepare("SELECT COUNT(*) AS n FROM users").get().n;
+async function accountCount() {
+  const row = await db.get("SELECT CAST(COUNT(*) AS INTEGER) AS n FROM users");
+  return row.n;
 }
 
 /* ---------- 校验 ---------- */
@@ -133,8 +161,8 @@ function weekSet(row) {
   return weeks;
 }
 
-function findConflicts(candidate, excludeId) {
-  const rows = db.prepare("SELECT * FROM courses WHERE id != ?").all(excludeId ?? -1);
+async function findConflicts(candidate, excludeId) {
+  const rows = await db.all("SELECT * FROM courses WHERE id != ?", [excludeId ?? -1]);
   const target = weekSet({
     week_start: candidate.weekStart,
     week_end: candidate.weekEnd,
@@ -164,28 +192,37 @@ function conflictResponse(res, conflicts) {
 
 /* ---------- 账号 ---------- */
 
-app.get("/api/me", (req, res) => {
+app.get("/api/me", async (req, res) => {
   res.json({
-    hasAccount: accountCount() > 0,
-    loggedIn: Boolean(userFromRequest(req)),
+    hasAccount: (await accountCount()) > 0,
+    loggedIn: Boolean(await userFromRequest(req)),
   });
 });
 
-app.post("/api/setup", (req, res) => {
-  if (accountCount() > 0) return res.status(409).json({ error: "账号已存在" });
+app.post("/api/setup", async (req, res) => {
+  if ((await accountCount()) > 0) return res.status(409).json({ error: "账号已存在" });
 
   const password = String(req.body.password ?? "");
   if (password.length < 6) return bad(res, "密码至少 6 位");
 
-  const info = db
-    .prepare("INSERT INTO users (username, password_hash, created_at) VALUES (?, ?, ?)")
-    .run("me", hashPassword(password), new Date().toISOString());
+  let user;
+  try {
+    user = await db.get(
+      "INSERT INTO users (username, password_hash, created_at) VALUES (?, ?, ?) RETURNING id",
+      ["me", hashPassword(password), new Date().toISOString()]
+    );
+  } catch (error) {
+    if (error.code === "23505" || /UNIQUE constraint failed: users\.username/.test(error.message)) {
+      return res.status(409).json({ error: "账号已存在" });
+    }
+    throw error;
+  }
 
-  startSession(res, Number(info.lastInsertRowid));
+  await startSession(res, Number(user.id));
   res.status(201).json({ ok: true });
 });
 
-app.post("/api/login", (req, res) => {
+app.post("/api/login", async (req, res) => {
   const ip = req.ip || "local";
   const record = loginFailures.get(ip);
   if (record && record.until > Date.now()) {
@@ -193,7 +230,7 @@ app.post("/api/login", (req, res) => {
   }
 
   const password = String(req.body.password ?? "");
-  const user = db.prepare("SELECT * FROM users ORDER BY id LIMIT 1").get();
+  const user = await db.get("SELECT * FROM users ORDER BY id LIMIT 1");
   if (!user || !verifyPassword(password, user.password_hash)) {
     const fails = (record?.count ?? 0) + 1;
     loginFailures.set(ip, {
@@ -204,51 +241,51 @@ app.post("/api/login", (req, res) => {
   }
 
   loginFailures.delete(ip);
-  startSession(res, user.id);
+  await startSession(res, user.id);
   res.json({ ok: true });
 });
 
-app.post("/api/logout", (req, res) => {
+app.post("/api/logout", async (req, res) => {
   const sid = readCookies(req).sid;
-  if (sid) sessions.delete(sid);
+  if (sid) {
+    await db.run("DELETE FROM sessions WHERE token_hash = ?", [sessionTokenHash(sid)]);
+  }
   res.clearCookie("sid", { path: "/" });
   res.json({ ok: true });
 });
 
 /* ---------- 课程 ---------- */
 
-app.get("/api/courses", requireAuth, (req, res) => {
-  const rows = db
-    .prepare("SELECT * FROM courses ORDER BY weekday, start_slot, id")
-    .all();
+app.get("/api/courses", requireAuth, async (req, res) => {
+  const rows = await db.all("SELECT * FROM courses ORDER BY weekday, start_slot, id");
   res.json({ courses: rows });
 });
 
-app.post("/api/courses", requireAuth, (req, res) => {
+app.post("/api/courses", requireAuth, async (req, res) => {
   const parsed = validCourse(req.body);
   if (parsed.error) return bad(res, parsed.error);
   const c = parsed.value;
 
   if (!req.body.force) {
-    const conflicts = findConflicts(c, null);
+    const conflicts = await findConflicts(c, null);
     if (conflicts.length) return conflictResponse(res, conflicts);
   }
 
-  const info = db
-    .prepare(
-      `INSERT INTO courses
-       (name, teacher, location, weekday, start_slot, end_slot, week_start, week_end, week_parity, color, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-    )
-    .run(
+  const row = await db.get(
+    `INSERT INTO courses
+     (name, teacher, location, weekday, start_slot, end_slot, week_start, week_end, week_parity, color, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     RETURNING id`,
+    [
       c.name, c.teacher, c.location, c.weekday, c.startSlot, c.endSlot,
       c.weekStart, c.weekEnd, c.weekParity, c.color, new Date().toISOString()
-    );
+    ]
+  );
 
-  res.status(201).json({ id: Number(info.lastInsertRowid) });
+  res.status(201).json({ id: Number(row.id) });
 });
 
-app.put("/api/courses/:id", requireAuth, (req, res) => {
+app.put("/api/courses/:id", requireAuth, async (req, res) => {
   const id = cleanInt(req.params.id, 1, Number.MAX_SAFE_INTEGER);
   if (!id) return bad(res, "无效的编号");
 
@@ -257,106 +294,103 @@ app.put("/api/courses/:id", requireAuth, (req, res) => {
   const c = parsed.value;
 
   if (!req.body.force) {
-    const conflicts = findConflicts(c, id);
+    const conflicts = await findConflicts(c, id);
     if (conflicts.length) return conflictResponse(res, conflicts);
   }
 
-  const info = db
-    .prepare(
-      `UPDATE courses SET name = ?, teacher = ?, location = ?, weekday = ?,
-       start_slot = ?, end_slot = ?, week_start = ?, week_end = ?, week_parity = ?, color = ?
-       WHERE id = ?`
-    )
-    .run(
+  const info = await db.run(
+    `UPDATE courses SET name = ?, teacher = ?, location = ?, weekday = ?,
+     start_slot = ?, end_slot = ?, week_start = ?, week_end = ?, week_parity = ?, color = ?
+     WHERE id = ?`,
+    [
       c.name, c.teacher, c.location, c.weekday, c.startSlot, c.endSlot,
       c.weekStart, c.weekEnd, c.weekParity, c.color, id
-    );
+    ]
+  );
 
   if (info.changes === 0) return res.status(404).json({ error: "课程不存在" });
   res.json({ ok: true });
 });
 
-app.delete("/api/courses/:id", requireAuth, (req, res) => {
+app.delete("/api/courses/:id", requireAuth, async (req, res) => {
   const id = cleanInt(req.params.id, 1, Number.MAX_SAFE_INTEGER);
   if (!id) return bad(res, "无效的编号");
-  db.prepare("DELETE FROM courses WHERE id = ?").run(id);
+  await db.run("DELETE FROM courses WHERE id = ?", [id]);
   res.json({ ok: true });
 });
 
 /* ---------- 作业 ---------- */
 
-app.get("/api/assignments", requireAuth, (req, res) => {
-  const rows = db
-    .prepare(
-      `SELECT a.*, c.name AS course_name, c.color AS course_color
-       FROM assignments a
-       LEFT JOIN courses c ON c.id = a.course_id
-       ORDER BY a.done ASC, a.due_date ASC, a.id DESC`
-    )
-    .all();
+app.get("/api/assignments", requireAuth, async (req, res) => {
+  const rows = await db.all(
+    `SELECT a.*, c.name AS course_name, c.color AS course_color
+     FROM assignments a
+     LEFT JOIN courses c ON c.id = a.course_id
+     ORDER BY a.done ASC, a.due_date ASC, a.id DESC`
+  );
   res.json({ assignments: rows });
 });
 
-app.post("/api/assignments", requireAuth, (req, res) => {
+app.post("/api/assignments", requireAuth, async (req, res) => {
   const title = cleanText(req.body.title, 80);
   const dueDate = cleanText(req.body.dueDate, 20);
   if (!title) return bad(res, "作业标题不能为空");
   if (!/^\d{4}-\d{2}-\d{2}/.test(dueDate)) return bad(res, "截止日期格式不正确");
 
   const courseId = req.body.courseId ? cleanInt(req.body.courseId, 1, Number.MAX_SAFE_INTEGER) : null;
-  if (courseId && !db.prepare("SELECT id FROM courses WHERE id = ?").get(courseId)) {
+  if (courseId && !(await db.get("SELECT id FROM courses WHERE id = ?", [courseId]))) {
     return bad(res, "课程不存在");
   }
 
-  const info = db
-    .prepare(
-      "INSERT INTO assignments (course_id, title, detail, due_date, done, created_at) VALUES (?, ?, ?, ?, 0, ?)"
-    )
-    .run(courseId, title, cleanText(req.body.detail, 300), dueDate, new Date().toISOString());
+  const row = await db.get(
+    "INSERT INTO assignments (course_id, title, detail, due_date, done, created_at) " +
+    "VALUES (?, ?, ?, ?, 0, ?) RETURNING id",
+    [courseId, title, cleanText(req.body.detail, 300), dueDate, new Date().toISOString()]
+  );
 
-  res.status(201).json({ id: Number(info.lastInsertRowid) });
+  res.status(201).json({ id: Number(row.id) });
 });
 
-app.patch("/api/assignments/:id", requireAuth, (req, res) => {
+app.patch("/api/assignments/:id", requireAuth, async (req, res) => {
   const id = cleanInt(req.params.id, 1, Number.MAX_SAFE_INTEGER);
   if (!id) return bad(res, "无效的编号");
 
-  const row = db.prepare("SELECT * FROM assignments WHERE id = ?").get(id);
+  const row = await db.get("SELECT * FROM assignments WHERE id = ?", [id]);
   if (!row) return res.status(404).json({ error: "作业不存在" });
 
   const done = req.body.done === undefined ? row.done : req.body.done ? 1 : 0;
-  db.prepare("UPDATE assignments SET done = ? WHERE id = ?").run(done, id);
+  await db.run("UPDATE assignments SET done = ? WHERE id = ?", [done, id]);
   res.json({ ok: true, done: Boolean(done) });
 });
 
-app.delete("/api/assignments/:id", requireAuth, (req, res) => {
+app.delete("/api/assignments/:id", requireAuth, async (req, res) => {
   const id = cleanInt(req.params.id, 1, Number.MAX_SAFE_INTEGER);
   if (!id) return bad(res, "无效的编号");
-  db.prepare("DELETE FROM assignments WHERE id = ?").run(id);
+  await db.run("DELETE FROM assignments WHERE id = ?", [id]);
   res.json({ ok: true });
 });
 
 /* ---------- 设置与示例数据 ---------- */
 
-app.get("/api/settings", requireAuth, (req, res) => {
-  res.json({ termStart: getSetting("termStart", "") });
+app.get("/api/settings", requireAuth, async (req, res) => {
+  res.json({ termStart: await getSetting("termStart", "") });
 });
 
-app.put("/api/settings", requireAuth, (req, res) => {
+app.put("/api/settings", requireAuth, async (req, res) => {
   const termStart = cleanText(req.body.termStart, 10);
   if (termStart && !/^\d{4}-\d{2}-\d{2}$/.test(termStart)) return bad(res, "日期格式不正确");
-  setSetting("termStart", termStart);
+  await setSetting("termStart", termStart);
   res.json({ ok: true });
 });
 
 /* ---------- 节次时间 ---------- */
 
-app.get("/api/periods", requireAuth, (req, res) => {
-  const rows = db.prepare("SELECT slot, start_time, end_time FROM periods ORDER BY slot").all();
+app.get("/api/periods", requireAuth, async (req, res) => {
+  const rows = await db.all("SELECT slot, start_time, end_time FROM periods ORDER BY slot");
   res.json({ periods: rows });
 });
 
-app.put("/api/periods", requireAuth, (req, res) => {
+app.put("/api/periods", requireAuth, async (req, res) => {
   const list = Array.isArray(req.body.periods) ? req.body.periods : [];
   if (list.length !== 12) return bad(res, "需要提供 12 个节次的时间");
 
@@ -373,18 +407,15 @@ app.put("/api/periods", requireAuth, (req, res) => {
     rows.push([slot, start, end]);
   }
 
-  const update = db.prepare(
-    "INSERT INTO periods (slot, start_time, end_time) VALUES (?, ?, ?) " +
-    "ON CONFLICT(slot) DO UPDATE SET start_time = excluded.start_time, end_time = excluded.end_time"
-  );
-  db.exec("BEGIN");
-  try {
-    for (const row of rows) update.run(row[0], row[1], row[2]);
-    db.exec("COMMIT");
-  } catch (error) {
-    db.exec("ROLLBACK");
-    throw error;
-  }
+  await db.transaction(async (tx) => {
+    for (const row of rows) {
+      await tx.run(
+        "INSERT INTO periods (slot, start_time, end_time) VALUES (?, ?, ?) " +
+        "ON CONFLICT(slot) DO UPDATE SET start_time = excluded.start_time, end_time = excluded.end_time",
+        row
+      );
+    }
+  });
 
   res.json({ ok: true });
 });
@@ -411,55 +442,60 @@ const SAMPLE_COURSES = [
   ["形势与政策I", "曾怡", "志学楼-阶梯3", 4, 9, 10, 3, 9, "odd", "#4338ca"],
 ];
 
-app.post("/api/demo-data", requireAuth, (req, res) => {
-  const count = db.prepare("SELECT COUNT(*) AS n FROM courses").get().n;
-  if (count > 0) return bad(res, "已经有课程了，先清空再试");
+app.post("/api/demo-data", requireAuth, async (req, res) => {
+  const count = await db.get("SELECT CAST(COUNT(*) AS INTEGER) AS n FROM courses");
+  if (count.n > 0) return bad(res, "已经有课程了，先清空再试");
 
   const now = new Date().toISOString();
-  const insertCourse = db.prepare(
-    `INSERT INTO courses
-     (name, teacher, location, weekday, start_slot, end_slot, week_start, week_end, week_parity, color, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-  );
-
-  db.exec("BEGIN");
-  try {
-    for (const c of SAMPLE_COURSES) {
-      insertCourse.run(c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7], c[8], c[9], now);
-    }
-    setSetting("termStart", "2026-09-07");
-    db.exec("COMMIT");
-  } catch (error) {
-    db.exec("ROLLBACK");
-    throw error;
-  }
-
   const today = new Date();
   const iso = (offset) => {
     const d = new Date(today);
     d.setDate(d.getDate() + offset);
     return d.toISOString().slice(0, 10);
   };
-  const idOf = (name) =>
-    db.prepare("SELECT id FROM courses WHERE name = ? ORDER BY id LIMIT 1").get(name)?.id ?? null;
-  const addTask = db.prepare(
-    "INSERT INTO assignments (course_id, title, detail, due_date, done, created_at) VALUES (?, ?, ?, ?, 0, ?)"
-  );
-  addTask.run(idOf("高等数学B(I)"), "习题 3.1 - 3.5", "第三章课后题", iso(1), now);
-  addTask.run(idOf("大学英语I"), "Unit 1 作文", "提交到课程平台", iso(4), now);
+
+  await db.transaction(async (tx) => {
+    for (const c of SAMPLE_COURSES) {
+      await tx.run(
+        `INSERT INTO courses
+         (name, teacher, location, weekday, start_slot, end_slot, week_start, week_end, week_parity, color, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7], c[8], c[9], now]
+      );
+    }
+    await tx.run(
+      "INSERT INTO settings (key, value) VALUES (?, ?) " +
+      "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+      ["termStart", "2026-09-07"]
+    );
+
+    const idOf = async (name) => {
+      const row = await tx.get(
+        "SELECT id FROM courses WHERE name = ? ORDER BY id LIMIT 1",
+        [name]
+      );
+      return row?.id ?? null;
+    };
+    const addTask = async (courseId, title, detail, dueDate) => {
+      await tx.run(
+        "INSERT INTO assignments (course_id, title, detail, due_date, done, created_at) " +
+        "VALUES (?, ?, ?, ?, 0, ?)",
+        [courseId, title, detail, dueDate, now]
+      );
+    };
+
+    await addTask(await idOf("高等数学B(I)"), "习题 3.1 - 3.5", "第三章课后题", iso(1));
+    await addTask(await idOf("大学英语I"), "Unit 1 作文", "提交到课程平台", iso(4));
+  });
 
   res.status(201).json({ ok: true });
 });
 
-app.post("/api/data/clear", requireAuth, (req, res) => {
-  db.exec("BEGIN");
-  try {
-    db.exec("DELETE FROM assignments; DELETE FROM courses;");
-    db.exec("COMMIT");
-  } catch (error) {
-    db.exec("ROLLBACK");
-    throw error;
-  }
+app.post("/api/data/clear", requireAuth, async (req, res) => {
+  await db.transaction(async (tx) => {
+    await tx.run("DELETE FROM assignments");
+    await tx.run("DELETE FROM courses");
+  });
   res.json({ ok: true });
 });
 
@@ -473,6 +509,13 @@ app.use((err, req, res, next) => {
   res.status(500).json({ error: "服务器出错了" });
 });
 
-app.listen(PORT, () => {
-  console.log(`course-planner running at http://localhost:${PORT}`);
-});
+const isMainModule = process.argv[1] &&
+  path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+
+if (isMainModule) {
+  app.listen(PORT, () => {
+    console.log(`course-planner running at http://localhost:${PORT} (${db.dialect})`);
+  });
+}
+
+export default app;

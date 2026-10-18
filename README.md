@@ -26,8 +26,8 @@
 | --- | --- | --- |
 | 前端 | 原生 HTML / CSS / JavaScript | 无框架，和作品集保持同一套风格 |
 | 后端 | Node.js + Express | REST 接口，JSON 传输 |
-| 数据库 | SQLite（Node 内置 `node:sqlite`） | 不用安装数据库软件，数据存在 `data/app.db` |
-| 鉴权 | scrypt 加盐哈希 + 会话 Cookie | 密码不存明文，Cookie 带 HttpOnly |
+| 数据库 | SQLite / PostgreSQL | 设置 `DATABASE_URL` 时使用 PostgreSQL（Neon），否则使用本地 `data/app.db` |
+| 鉴权 | scrypt 加盐哈希 + 数据库会话 | 密码不存明文，会话可跨 Vercel 实例使用，Cookie 带 HttpOnly |
 
 ## 运行
 
@@ -39,11 +39,32 @@ D:\self\dev\node\node.exe server.js
 
 打开 http://localhost:3000 ，第一次会要求设置密码。
 
+接口冒烟测试会使用临时 SQLite 数据目录，不会影响本地数据：
+
+```powershell
+D:\self\dev\node\npm.cmd test
+```
+
+## 部署到 Vercel
+
+1. 在 Vercel 项目中设置环境变量 `DATABASE_URL`，值为 Neon 的 PostgreSQL 连接串。
+2. 推送仓库后在 Vercel 导入项目，构建命令留空，Node.js 版本选择 22 或更高。
+3. `api/[...path].js` 会承接所有 `/api/*` 请求，`public/` 继续作为静态站点发布。
+
+也可以使用 Vercel CLI：
+
+```powershell
+D:\self\dev\node\npx.cmd vercel --prod
+```
+
 ## 目录
 
 ```
 server.js       接口与鉴权
-db.js           建表语句、数据库连接
+db.js           SQLite / PostgreSQL 连接与异步查询
+schema.js       两套数据库建表语句与默认节次
+api/            Vercel Serverless 入口
+scripts/        接口冒烟测试
 public/
   index.html    页面骨架
   app.js        界面渲染与交互
@@ -58,8 +79,10 @@ data/app.db     SQLite 数据文件（已被 .gitignore 忽略）
 - `assignments`：标题、关联课程、截止日期、完成状态
 - `periods`：12 个节次的开始与结束时间
 - `settings`：学期起始日期等键值配置
+- `sessions`：登录会话（数据库只保存令牌哈希）
 
 ## 注意
 
 - 第一次部署后请立刻访问站点设置密码，否则谁能先打开谁就能占用账号。
-- 密码忘记只能删除 `data/app.db` 重新开始（会丢失全部课程和作业）。
+- 本地模式忘记密码只能删除 `data/app.db` 重新开始（会丢失全部课程和作业）。
+- 在线模式的数据在 Neon 中，重置数据库密码不会删除课程和作业。
