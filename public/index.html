@@ -4,9 +4,20 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>课程表 · 作业提醒</title>
-  <meta name="theme-color" content="#f7f8f6">
+  <meta name="theme-color" content="#13181a" id="themeColor">
+  <meta name="description" content="按周查看课表，记录作业和截止日期。">
   <link rel="icon" href="favicon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="icon-192.png">
+  <link rel="manifest" href="manifest.webmanifest">
   <link rel="stylesheet" href="app.css">
+  <script>
+    // 在样式加载前定好主题，避免打开时闪白
+    (function () {
+      var saved = localStorage.getItem("theme");
+      var dark = saved ? saved === "dark" : window.matchMedia("(prefers-color-scheme: dark)").matches;
+      if (dark) document.documentElement.dataset.theme = "dark";
+    })();
+  </script>
 </head>
 <body>
   <div id="app"></div>

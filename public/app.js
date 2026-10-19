@@ -13,6 +13,9 @@ const state = {
   termStart: "",
   week: 1,
   tab: "timetable",
+  taskQuery: "",
+  taskStatus: "open",
+  courseFilter: "",
 };
 
 const $ = (selector, root = document) => root.querySelector(selector);
@@ -87,6 +90,10 @@ function dueLabel(due) {
 /* ---------- 启动 ---------- */
 
 async function boot() {
+  const savedTheme = localStorage.getItem("theme");
+  applyTheme(savedTheme || (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light"));
+  registerServiceWorker();
+
   try {
     state.me = await api("/api/me");
   } catch (error) {
@@ -101,6 +108,8 @@ async function boot() {
 
   await loadData();
   renderApp();
+  checkReminders();
+  setInterval(() => checkReminders(), 10 * 60 * 1000);
 }
 
 async function loadData() {
@@ -209,6 +218,16 @@ function renderApp() {
           <button class="link-btn" data-action="this-week">本周</button>
         </div>
         <div class="topbar-actions">
+          <button class="icon-btn" data-action="toggle-theme" aria-label="切换深浅色" title="切换深浅色（D）">
+            <svg class="icon-sun" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
+              <circle cx="12" cy="12" r="4"></circle>
+              <path d="M12 2v2M12 20v2M2 12h2M20 12h2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"></path>
+            </svg>
+            <svg class="icon-moon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"></path>
+            </svg>
+          </button>
+          <button class="icon-btn hide-sm" data-action="shortcuts" aria-label="键盘快捷键" title="键盘快捷键（?）">?</button>
           <button class="btn btn-ghost btn-sm" data-action="print">打印</button>
           <button class="btn btn-ghost btn-sm" data-action="settings">设置</button>
           <button class="btn btn-ghost btn-sm" data-action="logout">退出</button>
@@ -325,32 +344,70 @@ function renderTimetable() {
 }
 
 function renderAssignments() {
+  return `
+    <div class="filters">
+      <div class="search-box">
+        <svg class="search-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
+          <circle cx="11" cy="11" r="7"></circle><path d="m20 20-3.5-3.5"></path>
+        </svg>
+        <input id="taskSearch" type="search" placeholder="搜索作业、备注或课程（按 / 聚焦）"
+          value="${esc(state.taskQuery)}" autocomplete="off" aria-label="搜索作业">
+      </div>
+      <select id="courseFilter" aria-label="按课程筛选">
+        <option value="">全部课程</option>
+        ${state.courses.map((course) => `
+          <option value="${course.id}" ${state.courseFilter === String(course.id) ? "selected" : ""}>${esc(course.name)}</option>`).join("")}
+      </select>
+      <div class="seg" role="group" aria-label="按完成状态筛选">
+        ${[["open", "未完成"], ["all", "全部"], ["done", "已完成"]].map(([value, label]) => `
+          <button type="button" data-action="task-status" data-status="${value}"
+            aria-pressed="${state.taskStatus === value}">${label}</button>`).join("")}
+      </div>
+    </div>
+    <div id="taskListWrap">${renderTaskList()}</div>`;
+}
+
+function filteredAssignments() {
+  const query = state.taskQuery.trim().toLowerCase();
+  return state.assignments.filter((item) => {
+    if (state.taskStatus === "open" && item.done) return false;
+    if (state.taskStatus === "done" && !item.done) return false;
+    if (state.courseFilter && String(item.course_id ?? "") !== state.courseFilter) return false;
+    if (query) {
+      const haystack = `${item.title} ${item.detail ?? ""} ${item.course_name ?? ""}`.toLowerCase();
+      if (!haystack.includes(query)) return false;
+    }
+    return true;
+  });
+}
+
+function taskRow(item) {
+  const due = dueLabel(item.due_date);
+  return `<li class="task ${item.done ? "done" : ""}">
+    <input class="task-check" type="checkbox" ${item.done ? "checked" : ""}
+      data-action="toggle" data-id="${item.id}"
+      aria-label="${item.done ? "标记未完成" : "标记完成"}：${esc(item.title)}">
+    <div class="task-main">
+      <p class="task-title">${esc(item.title)}</p>
+      <p class="task-meta">
+        ${item.course_name ? `<span class="tag" style="--c:${item.course_color}">${esc(item.course_name)}</span>` : ""}
+        <span class="due ${due.tone}">${due.text}</span>
+        ${item.detail ? `<span>${esc(item.detail)}</span>` : ""}
+      </p>
+    </div>
+    <button class="icon-btn" data-action="delete-assignment" data-id="${item.id}" aria-label="删除作业">×</button>
+  </li>`;
+}
+
+function renderTaskList() {
   if (!state.assignments.length) {
     return `<p class="empty">还没有作业。点右下角的加号，添加第一条。</p>`;
   }
-
-  const open = state.assignments.filter((item) => !item.done);
-  const done = state.assignments.filter((item) => item.done);
-  const row = (item) => {
-    const due = dueLabel(item.due_date);
-    return `<li class="task ${item.done ? "done" : ""}">
-      <input class="task-check" type="checkbox" ${item.done ? "checked" : ""}
-        data-action="toggle" data-id="${item.id}"
-        aria-label="${item.done ? "标记未完成" : "标记完成"}：${esc(item.title)}">
-      <div class="task-main">
-        <p class="task-title">${esc(item.title)}</p>
-        <p class="task-meta">
-          ${item.course_name ? `<span class="tag" style="--c:${item.course_color}">${esc(item.course_name)}</span>` : ""}
-          <span class="due ${due.tone}">${due.text}</span>
-          ${item.detail ? `<span>${esc(item.detail)}</span>` : ""}
-        </p>
-      </div>
-      <button class="icon-btn" data-action="delete-assignment" data-id="${item.id}" aria-label="删除作业">×</button>
-    </li>`;
-  };
-
-  return `<ul class="tasks">${open.map(row).join("")}</ul>
-    ${done.length ? `<h2 class="subhead">已完成 ${done.length} 条</h2><ul class="tasks">${done.map(row).join("")}</ul>` : ""}`;
+  const items = filteredAssignments();
+  if (!items.length) {
+    return `<p class="empty">没有符合条件的作业。换个关键词或筛选条件试试。</p>`;
+  }
+  return `<ul class="tasks">${items.map(taskRow).join("")}</ul>`;
 }
 
 /* ---------- 弹窗 ---------- */
@@ -538,6 +595,19 @@ function openSettingsDialog() {
             </label>`).join("")}
         </div>
       </fieldset>
+      <fieldset class="periods">
+        <legend>作业提醒</legend>
+        <p class="notify-status" id="notifyStatus">${reminderStatus()}</p>
+        <div class="notify-actions">
+          <button type="button" class="btn btn-ghost btn-sm" data-action="enable-notifications">开启提醒</button>
+          <button type="button" class="btn btn-ghost btn-sm" data-action="test-notification">发一条测试提醒</button>
+        </div>
+      </fieldset>
+      <fieldset class="periods" id="installSection" hidden>
+        <legend>安装</legend>
+        <p class="notify-status">装到桌面后可以像 App 一样打开，断网也能查看课表。</p>
+        <button type="button" class="btn btn-ghost btn-sm" data-action="install-app">安装到桌面</button>
+      </fieldset>
       <div class="danger-zone">
         <div>
           <strong>清空数据</strong>
@@ -554,6 +624,10 @@ function openSettingsDialog() {
     </form>`;
 
   dialog.showModal();
+  if (installEvent) {
+    const installSection = $("#installSection");
+    if (installSection) installSection.hidden = false;
+  }
 
   $("#settingsForm").addEventListener("submit", async (event) => {
     event.preventDefault();
@@ -583,6 +657,120 @@ function openSettingsDialog() {
     } catch (error) {
       alert(error.message);
     }
+  });
+}
+
+/* ---------- 主题 / 快捷键 / 提醒 / PWA ---------- */
+
+function applyTheme(theme) {
+  const dark = theme === "dark";
+  document.documentElement.dataset.theme = dark ? "dark" : "";
+  localStorage.setItem("theme", dark ? "dark" : "light");
+  const meta = document.getElementById("themeColor");
+  if (meta) meta.setAttribute("content", dark ? "#0f1413" : "#13181a");
+}
+
+function toggleTheme() {
+  applyTheme(document.documentElement.dataset.theme === "dark" ? "light" : "dark");
+}
+
+function openShortcutsDialog() {
+  const dialog = $("#dialog");
+  dialog.innerHTML = `
+    <div class="dialog-form">
+      <h2>键盘快捷键</h2>
+      <dl class="shortcuts">
+        <div><dt><kbd>N</kbd></dt><dd>新建课程或作业</dd></div>
+        <div><dt><kbd>1</kbd> <kbd>2</kbd></dt><dd>切换课表 / 作业</dd></div>
+        <div><dt><kbd>←</kbd> <kbd>→</kbd></dt><dd>上一周 / 下一周</dd></div>
+        <div><dt><kbd>T</kbd></dt><dd>回到本周</dd></div>
+        <div><dt><kbd>/</kbd></dt><dd>搜索作业</dd></div>
+        <div><dt><kbd>D</kbd></dt><dd>切换深浅色</dd></div>
+        <div><dt><kbd>Esc</kbd></dt><dd>关闭弹窗</dd></div>
+      </dl>
+      <div class="dialog-actions">
+        <span class="spacer"></span>
+        <button type="button" class="btn btn-primary" data-action="close-dialog">知道了</button>
+      </div>
+    </div>`;
+  dialog.showModal();
+}
+
+function reminderStatus() {
+  if (!("Notification" in window)) return "当前浏览器不支持通知";
+  if (Notification.permission === "denied") return "通知被浏览器拒绝，需要在站点设置里恢复";
+  if (Notification.permission !== "granted") return "未开启";
+  return localStorage.getItem("reminders.enabled") === "1"
+    ? "已开启，作业到期前会提醒"
+    : "已授权，点下面的按钮启用";
+}
+
+async function enableNotifications() {
+  if (!("Notification" in window)) return alert("当前浏览器不支持通知");
+  let permission = Notification.permission;
+  if (permission === "default") permission = await Notification.requestPermission();
+  if (permission !== "granted") {
+    return alert("没有拿到通知权限。可以在浏览器地址栏左侧的站点设置里允许通知后重试。");
+  }
+  localStorage.setItem("reminders.enabled", "1");
+  const status = $("#notifyStatus");
+  if (status) status.textContent = reminderStatus();
+  checkReminders({ force: true });
+}
+
+function sendTestNotification() {
+  if (!("Notification" in window)) return alert("当前浏览器不支持通知");
+  if (Notification.permission !== "granted") return alert("先点「开启提醒」并允许通知");
+  new Notification("这是一条测试提醒", {
+    body: "作业快到截止日期时，会收到这样的提醒。",
+    icon: "./icon-192.png",
+    tag: "test-reminder",
+  });
+}
+
+function checkReminders({ force = false } = {}) {
+  if (!("Notification" in window) || Notification.permission !== "granted") return;
+  if (localStorage.getItem("reminders.enabled") !== "1") return;
+
+  const today = isoDate(new Date());
+  const tomorrow = isoDate(new Date(Date.now() + 86400000));
+  const pending = state.assignments.filter((item) => !item.done && item.due_date <= tomorrow);
+  if (!pending.length) return;
+
+  const key = `reminders.last.${today}`;
+  if (!force && localStorage.getItem(key) === "1") return;
+
+  const names = pending.slice(0, 3).map((item) => item.title).join("、");
+  const body = pending.length > 3
+    ? `${names} 等 ${pending.length} 条作业即将到期`
+    : `${names} 即将到期`;
+  try {
+    new Notification("作业提醒", { body, icon: "./icon-192.png", tag: "assignment-reminder" });
+    localStorage.setItem(key, "1");
+  } catch {
+    // 个别浏览器只允许通过 Service Worker 发通知，失败时静默跳过
+  }
+}
+
+let installEvent = null;
+window.addEventListener("beforeinstallprompt", (event) => {
+  event.preventDefault();
+  installEvent = event;
+});
+
+async function promptInstall() {
+  if (!installEvent) {
+    return alert("当前浏览器没有提供安装入口，可以试试浏览器菜单里的「安装应用」。");
+  }
+  installEvent.prompt();
+  await installEvent.userChoice.catch(() => null);
+  installEvent = null;
+}
+
+function registerServiceWorker() {
+  if (!("serviceWorker" in navigator)) return;
+  window.addEventListener("load", () => {
+    navigator.serviceWorker.register("./sw.js").catch(() => {});
   });
 }
 
@@ -657,6 +845,19 @@ document.addEventListener("click", async (event) => {
     }
     return;
   }
+  if (action === "toggle-theme") return toggleTheme();
+  if (action === "shortcuts") return openShortcutsDialog();
+  if (action === "task-status") {
+    state.taskStatus = trigger.dataset.status;
+    document.querySelectorAll('[data-action="task-status"]').forEach((button) => {
+      button.setAttribute("aria-pressed", String(button.dataset.status === state.taskStatus));
+    });
+    $("#taskListWrap").innerHTML = renderTaskList();
+    return;
+  }
+  if (action === "enable-notifications") return enableNotifications();
+  if (action === "test-notification") return sendTestNotification();
+  if (action === "install-app") return promptInstall();
   if (action === "logout") {
     await api("/api/logout", { method: "POST" });
     return location.reload();
@@ -664,6 +865,11 @@ document.addEventListener("click", async (event) => {
 });
 
 document.addEventListener("change", async (event) => {
+  if (event.target.id === "courseFilter") {
+    state.courseFilter = event.target.value;
+    $("#taskListWrap").innerHTML = renderTaskList();
+    return;
+  }
   const trigger = event.target.closest('[data-action="toggle"]');
   if (!trigger) return;
   try {
@@ -675,6 +881,42 @@ document.addEventListener("change", async (event) => {
     renderApp();
   } catch (error) {
     alert(error.message);
+  }
+});
+
+document.addEventListener("input", (event) => {
+  if (event.target.id !== "taskSearch") return;
+  state.taskQuery = event.target.value;
+  const wrap = $("#taskListWrap");
+  if (wrap) wrap.innerHTML = renderTaskList();
+});
+
+document.addEventListener("keydown", (event) => {
+  if (event.ctrlKey || event.metaKey || event.altKey) return;
+  if (event.target.closest("input, textarea, select, [contenteditable]")) return;
+  const dialog = $("#dialog");
+  if (dialog && dialog.open) return;
+
+  if (event.key === "n" || event.key === "N") {
+    event.preventDefault();
+    return state.tab === "timetable" ? openCourseDialog() : openAssignmentDialog();
+  }
+  if (event.key === "1") { state.tab = "timetable"; return renderApp(); }
+  if (event.key === "2") { state.tab = "assignments"; return renderApp(); }
+  if (event.key === "t" || event.key === "T") { state.week = weekNumberToday(); return renderApp(); }
+  if (event.key === "d" || event.key === "D") return toggleTheme();
+  if (event.key === "?") { event.preventDefault(); return openShortcutsDialog(); }
+  if (event.key === "/") {
+    if (state.tab === "assignments") {
+      event.preventDefault();
+      $("#taskSearch")?.focus();
+    }
+    return;
+  }
+  if (state.tab === "timetable" && (event.key === "ArrowLeft" || event.key === "ArrowRight")) {
+    event.preventDefault();
+    state.week = Math.max(1, state.week + (event.key === "ArrowRight" ? 1 : -1));
+    return renderApp();
   }
 });
 
