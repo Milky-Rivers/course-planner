@@ -1,4 +1,3 @@
-import { DatabaseSync } from "node:sqlite";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -130,6 +129,8 @@ async function initializeDatabase() {
   } else {
     const dataDir = process.env.DATA_DIR || path.join(__dirname, "data");
     fs.mkdirSync(dataDir, { recursive: true });
+    // 按需加载：用 PostgreSQL 部署时（Node 22 需要实验开关）不会碰这个模块
+    const { DatabaseSync } = await import("node:sqlite");
     sqlite = new DatabaseSync(path.join(dataDir, "app.db"));
     sqlite.exec(SQLITE_SCHEMA);
 

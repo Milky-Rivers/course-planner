@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: course-planner
+    runtime: node
+    plan: free
+    region: singapore
+    branch: main
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /api/me
+    autoDeploy: true
+    envVars:
+      - key: NODE_VERSION
+        value: "24"
+      # 在 Render 控制台填入 Neon / Render PostgreSQL 的连接串
+      - key: DATABASE_URL
+        sync: false

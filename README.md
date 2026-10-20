@@ -67,6 +67,18 @@ D:\self\dev\node\npm.cmd test
 D:\self\dev\node\npx.cmd vercel --prod
 ```
 
+## 部署到 Render
+
+仓库根目录带了 `render.yaml`，用 Blueprint 一次建好 Web Service：
+
+1. 登录 [render.com](https://render.com)，`New` → `Blueprint`，连接仓库 `Milky-Rivers/course-planner`。
+2. Render 读取 `render.yaml` 后会提示填写 `DATABASE_URL`，把 Neon 的连接串粘进去（在 Vercel 项目的 `Settings → Environment Variables` 里能复制到）。
+3. 点 `Apply`，等构建完成，访问 `https://course-planner.onrender.com`。
+
+不想用 Blueprint 也可以 `New` → `Web Service`，Build Command 填 `npm install`，Start Command 填 `npm start`，环境变量加 `DATABASE_URL` 和 `NODE_VERSION=24`。
+
+免费实例 15 分钟没有请求会休眠，下次访问约 50 秒冷启动；绑定自定义域名后国内访问会稳定一些。
+
 ## 目录
 
 ```
